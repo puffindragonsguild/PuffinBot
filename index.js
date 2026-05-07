@@ -1,243 +1,114 @@
 // index.js
-const ADMIN_ROLE_NAME = "Bot Admin"; 
+const fs = require('fs');
+const path = require('path');
 const { 
-    Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, 
-    ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle, 
-    StringSelectMenuBuilder, MessageFlags 
+    Client, GatewayIntentBits, Collection, ActionRowBuilder, 
+    ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, 
+    TextInputStyle, StringSelectMenuBuilder, MessageFlags 
 } = require('discord.js');
+
+const ADMIN_ROLE_NAME = "Bot Admin"; 
 const messages = require('./messages.js');
 const db = require('./database.js'); 
+const raidManager = require('./raidManager.js');
+const radarManager = require('./radarManager.js');
+const lotteryManager = require('./lotteryManager.js');
+
 
 const client = new Client({ 
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] 
 });
 
-let gatesOpen = false;
-let hypeInterval;
-let lastRosterMessage = null; 
+// 🧠 CREATE THE COMMAND COLLECTION
+client.commands = new Collection();
 
-client.once('clientReady', () => {
+// 📂 READ THE COMMANDS FOLDER
+const commandsPath = path.join(__dirname, 'commands');
+// Make sure the /commands folder exists before trying to read it
+if (!fs.existsSync(commandsPath)) {
+    fs.mkdirSync(commandsPath);
+}
+const commandFiles = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'));
+
+for (const file of commandFiles) {
+    const filePath = path.join(commandsPath, file);
+    const command = require(filePath);
+    
+    if ('name' in command && 'execute' in command) {
+        client.commands.set(command.name, command);
+    } else {
+        console.log(`[WARNING] The command at ${filePath} is missing a required "name" or "execute" property.`);
+    }
+}
+
+client.once('clientReady', async () => {
     console.log('🤖 PuffinBot Engine is ONLINE!');
+
+    // --- AUTO-RESUME STATE RECOVERY ---
+    const activeTasks = db.prepare('SELECT * FROM active_tasks').all();
+    
+    for (const task of activeTasks) {
+        try {
+            // Find the specific channel the task belongs to
+            const channel = await client.channels.fetch(task.channel_id);
+            if (!channel) continue;
+
+            if (task.task_name === 'RADAR_FRIENDLY') {
+                console.log('🔄 Auto-resuming Friendly Radar...');
+                radarManager.startRadar(channel, db, 'FRIENDLY', true, task.extra_data);
+            }
+            else if (task.task_name === 'RADAR_NAUGHTY') {
+                console.log('🔄 Auto-resuming Naughty Radar...');
+                radarManager.startRadar(channel, db, 'NAUGHTY', true, task.extra_data);
+            }
+            else if (task.task_name === 'LOTTERY') {
+                console.log('🔄 Auto-resuming Lottery Loop...');
+                lotteryManager.startLotteryLoop(channel, db, true);
+            }
+            else if (task.task_name === 'RAID_HYPE') {
+                console.log(`🔄 Auto-resuming Raid Gates for ${task.extra_data}...`);
+                raidManager.startHypeLoop(channel, task.extra_data, db, true);
+            }
+            
+        } catch (err) {
+            console.error(`⚠️ Failed to resume ${task.task_name}:`, err);
+        }
+    }
 });
 
-// --- DATE FUNCTION --- //
-function getNextWednesday() {
-    const today = new Date();
-    const nextWed = new Date();
-    const daysUntilWed = (3 - today.getDay() + 7) % 7 || 7;
-    nextWed.setDate(today.getDate() + daysUntilWed);
-    return nextWed.toLocaleDateString('en-GB', { day: 'numeric', month: 'long' });
-}
-
-// --- REUSABLE ROSTER FUNCTION ---
-async function displayRoster(target) {
-    const allSignups = db.prepare('SELECT * FROM signups ORDER BY id ASC').all();
-    if (allSignups.length === 0) return;
-
-    if (lastRosterMessage) {
-        try { await lastRosterMessage.delete(); } catch (e) { console.error("Could not delete old roster"); }
-    }
-
-    const rosterEmbed = { title: "📜 Official Raid Roster", color: 0x0099ff, fields: [] };
-    const maxPlayers = 15;
-    const fortyEightHours = 48 * 60 * 60 * 1000;
-    const firstSignupTime = new Date(allSignups[0].created_at || Date.now()).getTime();
-    const windowExpired = (Date.now() - firstSignupTime) > fortyEightHours;
-
-    const row = new ActionRowBuilder();
-    const currentBosses = [...new Set(allSignups.map(s => s.boss_choice))];
-    
-    const hasDT = currentBosses.some(b => b.includes('LLK') || b.includes('HOD') || b.includes('BOTH'));
-    const hasFeru = currentBosses.some(b => b.includes('FERU'));
-
-    if (hasDT) {
-        row.addComponents(
-            new ButtonBuilder().setCustomId('choice_LLK').setLabel('LLK').setStyle(ButtonStyle.Primary).setEmoji('⚔️'),
-            new ButtonBuilder().setCustomId('choice_HOD').setLabel('HoD').setStyle(ButtonStyle.Success).setEmoji('🛡️'),
-            new ButtonBuilder().setCustomId('choice_BOTH').setLabel('Both').setStyle(ButtonStyle.Danger).setEmoji('🔥')
-        );
-    } else if (hasFeru) {
-        row.addComponents(new ButtonBuilder().setCustomId('choice_FERU').setLabel('Ferumbras').setStyle(ButtonStyle.Danger).setEmoji('🧙‍♂️'));
-    }
-    row.addComponents(new ButtonBuilder().setCustomId('dropout_btn').setLabel('Drop Out').setStyle(ButtonStyle.Secondary).setEmoji('🏃'));
-
-    const addSection = (name, emoji, key) => {
-        const players = allSignups.filter(p => 
-            p.boss_choice.includes(key) || 
-            (p.boss_choice.includes('BOTH') && (key === 'LLK' || key === 'HOD')) ||
-            p.boss_choice === 'LAST_RESORT'
-        );
-
-        if (players.length > 0) {
-            let lastResorts = players.filter(p => p.boss_choice === 'LAST_RESORT');
-            let others = players.filter(p => p.boss_choice !== 'LAST_RESORT');
-            let mainList = windowExpired ? others : others.filter(p => !p.boss_choice.startsWith('PUBLIC_'));
-            let publicQueue = windowExpired ? [] : others.filter(p => p.boss_choice.startsWith('PUBLIC_'));
-
-            const mainTeam = mainList.slice(0, maxPlayers);
-            const puffinReserves = mainList.slice(maxPlayers);
-
-            const mainText = mainTeam.map(p => `• **${p.character_name}** [Lvl ${p.level}] (${p.vocation})`).join('\n');
-            rosterEmbed.fields.push({ name: `${emoji} ${name} TEAM (${mainTeam.length}/${maxPlayers})`, value: mainText || "Empty", inline: false });
-
-            if (puffinReserves.length > 0) {
-                const resText = puffinReserves.map(p => `• **${p.character_name}** [Lvl ${p.level}] (${p.vocation})`).join('\n');
-                rosterEmbed.fields.push({ name: `⏳ ${name} PUFFIN RESERVES`, value: resText, inline: false });
-            }
-
-            if (publicQueue.length > 0) {
-                const publicText = publicQueue.map(p => `• **${p.character_name}** [Lvl ${p.level}] (${p.vocation})`).join('\n');
-                rosterEmbed.fields.push({ name: `📢 ${name} PUBLIC QUEUE (Waitlist)`, value: publicText, inline: false });
-            }
-
-            if (lastResorts.length > 0) {
-                const lastText = lastResorts.map(p => `• **${p.character_name}** [Lvl ${p.level}] (${p.vocation})`).join('\n');
-                rosterEmbed.fields.push({ name: `🆘 ${name} LAST RESORT RESERVES`, value: lastText, inline: false });
-            }
-        }
-    };
-
-    if (hasDT) { addSection('LLK', '⚔️', 'LLK'); addSection('HoD', '🛡️', 'HOD'); }
-    if (hasFeru) { addSection('FERUMBRAS', '🧙‍♂️', 'FERU'); }
-
-    const timeLeft = Math.max(0, (fortyEightHours - (Date.now() - firstSignupTime)) / (1000 * 60 * 60));
-    rosterEmbed.footer = { 
-        text: (windowExpired ? "✅ Public queue merged." : `🕒 Public queue merges in ${timeLeft.toFixed(1)}h.`) + "\n❌ Type !dropout to flee"
-    };
-
-    lastRosterMessage = await target.send({ embeds: [rosterEmbed], components: row.components.length > 0 ? [row] : [] });
-}
-
-// --- HYPE LOOP ---
-const startHypeLoop = (message, raidType) => {
-    if (hypeInterval) clearInterval(hypeInterval);
-    hypeInterval = setInterval(() => { // ✅ Edited to 48 hours[cite: 1]
-        if (!gatesOpen) return clearInterval(hypeInterval);
-        message.channel.send(`🔥 **THE RAID CONTINUES!** 🔥\nStill need Puffins for **${raidType}**!`);
-        displayRoster(message.channel);
-    }, 48 * 60 * 60 * 1000); 
-};
 
 // ---------------------------------------------------------
-// 1. CHAT COMMANDS
+// 1. DYNAMIC COMMAND HANDLER
 // ---------------------------------------------------------
 client.on('messageCreate', async message => {
-    if (message.author.bot) return;
+    // Ignore bots and messages that don't start with our prefix "!"
+    if (message.author.bot || !message.content.startsWith('!')) return;
 
+    // Split the message into the command name and its arguments
+    const args = message.content.slice(1).trim().split(/ +/);
+    const commandName = args.shift().toLowerCase();
+
+    // Check if the command exists in our Collection
+    const command = client.commands.get(commandName);
+    if (!command) return;
+
+    // Admin Permission Check 🛡️
     const isAdmin = message.member?.roles.cache.some(role => role.name === ADMIN_ROLE_NAME);
+    if (command.adminOnly && !isAdmin) {
+        return message.reply('🛑 **Halt!** The Queen forbids you from using this command.');
+    }
 
-    if (message.content === '!hail') message.reply('HAIL FORTUNA FELIS! 👑');
-    if (message.content === '!roster') displayRoster(message.channel);
-
-    if (isAdmin) {
-        if (message.content === '!announce') {
-            const announceEmbed = {
-                title: "📜 ANNOUNCEMENT: THE QUEEN'S LITTLE DEVICE HAS ARRIVED!",
-                color: 0xffd700, 
-                description: "###  Hear ye! Hear ye! @everyone\n\nBy decree of the Glorious Leader, **Fortuna Felis**, the PuffinBot is now officially online! 🤖⚔️\n\nOur Boss Finals sign-up system has been upgraded! A small, diligent mechanism now sits beside the throne, keeping the register. Whether you seek the top Puffin Boss Team or offer your strength as a Reserve, the Queen’s little mechanism is active. Do try to behave!\n",
-                fields: [
-                    { name: "🛡️ How to Join", value: "Click the boss buttons below to register. You will be asked for your status and a personal and suitably Puffin-like message for our Queen!" },
-                    { name: "😴 Lazy Option", value: "Feeling uninspired? Use the Lazy Option message, but be warned the Queen may not approve!" },
-                    { name: "🏃 Dropping Out", value: "Should cowardice take hold, use the 'Drop Out' button or type `!dropout`." }
-                ],
-                footer: { text: "👑 Hail Pufffin Dragons! Long live the Queen! | Powered by PuffinBot" }
-            };
-            await message.channel.send({ embeds: [announceEmbed] });
-            message.delete().catch(() => {});
-        }
-
-        if (message.content === '!open dt') {
-            gatesOpen = true;
-            const raidDate = getNextWednesday(); 
-            const dtEmbed = {
-                title: "🚨 LAST LOREKEEPER & WORLD DEVOURER 🚨",
-                color: 0xff0000, 
-                description: `📅 **Wednesday ${raidDate}** at **22:00 CEST**\n\n@everyone Come and claim your space to have fun with the guild and for a chance for treasure including the elusive undevoured egg or a key that is impossible to sell.\n\nBring your **5** HoD charges, your A-Game and don't watch Chelsea if you're a paladin.\n`,
-                fields: [
-                    { name: "🛡️ Priority Window", value: "Puffins have priority for the first 48 hours. Others will join the Public Waitlist." },
-                    { name: "⚔️ Bosses", value: "We are running **Both** LLK and HoD back-to-back." }
-                ],
-                footer: { text: "Hail Puffin Dragons! | Powered by PuffinBot" }
-            };
-
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId('choice_LLK').setLabel('LLK').setStyle(ButtonStyle.Primary).setEmoji('⚔️'),
-                new ButtonBuilder().setCustomId('choice_HOD').setLabel('HoD').setStyle(ButtonStyle.Success).setEmoji('🛡️'),
-                new ButtonBuilder().setCustomId('choice_BOTH').setLabel('Both').setStyle(ButtonStyle.Danger).setEmoji('🔥')
-            );
-
-            message.channel.send({ embeds: [dtEmbed], components: [row] });
-            startHypeLoop(message, 'Double Trouble');
-        }
-
-        if (message.content === '!open feru') {
-            gatesOpen = true;
-            const raidDate = getNextWednesday();
-            const feruEmbed = {
-                title: "🧙‍♂️ FERUMBRAS 🧙‍♂️",
-                color: 0x9b59b6, 
-                description: `📅 **Wednesday ${raidDate}** at **22:00 CEST**\n\n@everyone Come raid the hellish lair with us to slay the Mortal Shell of Ferumbras and snatch the hat off his head or the scroll that Dennis insists exists. Bring your diving helmet and your A-Game.`,
-                fields: [
-                    { name: "🛡️ Priority Window", value: "Puffins have priority for the first 48 hours. Others will join the Public Waitlist.", inline: true }
-                ],
-                footer: { text: "👑 Hail the Queen at the lever! | Powered by PuffinBot" }
-            };
-
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId('choice_FERU').setLabel('Ferumbras').setStyle(ButtonStyle.Danger).setEmoji('🧙‍♂️')
-            );
-
-            message.channel.send({ embeds: [feruEmbed], components: [row] });
-            startHypeLoop(message, 'Ferumbras');
-        }
-
-        if (message.content === '!open reserves') {
-            gatesOpen = true;
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId('choice_LASTRESORT').setLabel('Last Resort').setStyle(ButtonStyle.Secondary).setEmoji('🆘')
-            );
-            message.channel.send({ content: '⚠️ **RESERVES OPEN** ⚠️', components: [row] });
-        }
-
-        if (message.content === '!close') {
-            gatesOpen = false;
-            if (hypeInterval) clearInterval(hypeInterval);
-            message.reply('🛑 **The gates are now CLOSED.**');
-        }
-
-        if (message.content === '!clear') {
-            db.prepare('DELETE FROM signups').run();
-            message.reply('🧹 **Roster wiped clean!**');
-        }
-
-        if (message.content.startsWith('!whitelist ')) {
-            const args = message.content.split(' ');
-            const action = args[1];
-            const name = args.slice(2).join(' ');
-            if (action === 'add') {
-                db.prepare('INSERT OR IGNORE INTO whitelist (char_name) VALUES (?)').run(name);
-                message.reply(`✅ **${name}** added to Whitelist.`);
-            } else if (action === 'remove') {
-                db.prepare('DELETE FROM whitelist WHERE char_name = ?').run(name);
-                message.reply(`🗑️ **${name}** removed from whitelist.`);
-            }
-        }
-
-        if (message.content.startsWith('!remove ')) {
-            const charName = message.content.replace('!remove ', '').trim();
-            const info = db.prepare('DELETE FROM signups WHERE LOWER(character_name) = LOWER(?)').run(charName);
-            if (info.changes > 0) {
-                message.reply(`🗑️ Purged: ${charName} has been removed.`);
-                displayRoster(message.channel);
-            } else {
-                message.reply(`The Queen does not acknowledge your existence.❓ Character ${charName} not found.`);
-            }
-        }
+    // Execute the command!
+    try {
+        command.execute(message, args, client, db, raidManager);
+    } catch (error) {
+        console.error(error);
+        message.reply('⚠️ **Error:** A rogue mechanism broke while trying to execute that command!');
     }
 });
 
 // ---------------------------------------------------------
-// 2. INTERACTIONS
+// 2. INTERACTIONS (Buttons, Modals, Menus)
 // ---------------------------------------------------------
 client.on('interactionCreate', async interaction => {
     if (interaction.isButton()) {
@@ -258,7 +129,8 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (interaction.customId.startsWith('choice_')) {
-            if (!gatesOpen) return interaction.reply({ content: messages.getRandom(messages.closedGates), flags: MessageFlags.Ephemeral });
+            // 👇 Updated to use raidManager state
+            if (!raidManager.isGatesOpen()) return interaction.reply({ content: messages.getRandom(messages.closedGates), flags: MessageFlags.Ephemeral });
             const boss = interaction.customId.replace('choice_', '');
             const row = new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setCustomId(`queue_MAIN_${boss}`).setLabel('Main Team').setStyle(ButtonStyle.Success).setEmoji('🛡️'),
@@ -303,7 +175,9 @@ client.on('interactionCreate', async interaction => {
             db.prepare('DELETE FROM signups WHERE id = ?').run(signupId);
         }
         await interaction.update({ content: "Processed.", components: [] });
-        displayRoster(interaction.channel);
+        
+        // 👇 Updated to use raidManager
+        raidManager.displayRoster(interaction.channel);
     }
 
     if (interaction.isModalSubmit()) {
@@ -336,7 +210,6 @@ client.on('interactionCreate', async interaction => {
             else if (rawVoc.includes('PALADIN')) { vocAbbr = 'RP'; vocEmoji = '🏹'; }
             else if (rawVoc.includes('MONK')) { vocAbbr = 'EM'; vocEmoji = '🥋'; }
 
-            // ✅ CHANGE FOR FORTUNA FELIS[cite: 1]
             if (charName === "Fortuna Felis") { vocEmoji = '👑'; }
 
             db.prepare('INSERT INTO signups (discord_user_id, character_name, vocation, level, boss_choice, message_to_queen) VALUES (?, ?, ?, ?, ?, ?)')
@@ -350,7 +223,6 @@ client.on('interactionCreate', async interaction => {
             replyText += `\n👑 **Message to the court:** *"${queenMessage}"*`;
 
             await interaction.editReply({ content: replyText });
-            // ✅ ROSTER NO LONGER SENT AUTOMATICALLY HERE[cite: 1]
         } catch (e) { console.error(e); await interaction.editReply("⚠️ API Error."); }
     }
 });

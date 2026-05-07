@@ -1,12 +1,18 @@
 // database.js
 const Database = require('better-sqlite3');
 const fs = require('fs');
+const path = require('path');
 
-if (!fs.existsSync('./data')) {
-    fs.mkdirSync('./data');
+// This tells the bot: "If Railway gives us a specific folder path, use it. Otherwise, use our local folder."
+const dataFolder = process.env.DATA_DIR || path.join(__dirname, 'data');
+
+if (!fs.existsSync(dataFolder)) {
+    fs.mkdirSync(dataFolder, { recursive: true });
 }
 
-const db = new Database('./data/puffin.db');
+const dbPath = path.join(dataFolder, 'puffin.db');
+const db = new Database(dbPath);
+
 
 db.prepare(`
     CREATE TABLE IF NOT EXISTS signups (
@@ -46,5 +52,62 @@ db.prepare(`
 `).run();
 
 console.log("💾 Whitelist Memory Banks: ONLINE");
+
+// Create the Tracked Guilds table
+db.prepare(`
+    CREATE TABLE IF NOT EXISTS tracked_guilds (
+        guild_name TEXT PRIMARY KEY,
+        type TEXT
+    )
+`).run();
+
+// Create the Tracked Characters table (For Alts, Friends, and Naughty lists)
+db.prepare(`
+    CREATE TABLE IF NOT EXISTS tracked_chars (
+        char_name TEXT PRIMARY KEY,
+        type TEXT
+    )
+`).run();
+
+console.log("💾 Radar Memory Banks: ONLINE");
+
+// Create the Trackers table (Links Characters to Discord Users)
+db.prepare(`
+    CREATE TABLE IF NOT EXISTS trackers (
+        character_name TEXT PRIMARY KEY,
+        discord_user_id TEXT,
+        main_char TEXT,
+        tracker_type TEXT DEFAULT 'PUFFIN'
+    )
+`).run();
+
+console.log("💾 Tracker Memory Banks: ONLINE");
+
+// Safely upgrade trackers table for the Lottery Deactivation feature
+try {
+    db.prepare('ALTER TABLE trackers ADD COLUMN is_active INTEGER DEFAULT 1').run();
+    console.log("💾 Database upgraded: Added 'is_active' column to trackers.");
+} catch (err) {
+    // Silently skip if column already exists
+}
+
+// State Recovery Table (Auto-Resume after restarts)
+db.prepare(`
+    CREATE TABLE IF NOT EXISTS active_tasks (
+        task_name TEXT PRIMARY KEY,
+        channel_id TEXT,
+        next_run_time INTEGER,
+        extra_data TEXT
+    )
+`).run();
+console.log("💾 State Recovery Banks: ONLINE");
+
+// Naughty Alert Subscribers
+db.prepare(`
+    CREATE TABLE IF NOT EXISTS alert_subscribers (
+        discord_user_id TEXT PRIMARY KEY
+    )
+`).run();
+console.log("💾 Alert Memory Banks: ONLINE");
 
 module.exports = db;
