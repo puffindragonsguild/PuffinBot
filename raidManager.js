@@ -1,154 +1,257 @@
-// raidManager.js
-const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-const db = require('./database.js');
+const { EmbedBuilder } = require('discord.js');
 
-// 🔒 State Variables (Encapsulated here!)
-let gatesOpen = false;
-let hypeTimer = null;
-let lastRosterMessage = null;
+const WORLD_NAME = "Peloria"; // 👈 CHANGE THIS TO YOUR TIBIA WORLD!
+const CORE_GUILDS = ["Puffin Dragons", "Slightly Smaller Dragons", "Noobemon"];
 
-// --- DATE FUNCTION ---
-function getNextWednesday() {
-    const today = new Date();
-    const nextWed = new Date();
-    const daysUntilWed = (3 - today.getDay() + 7) % 7 || 7;
-    nextWed.setDate(today.getDate() + daysUntilWed);
-    return nextWed.toLocaleDateString('en-GB', { day: 'numeric', month: 'long' });
-}
+// Split memory for two isolated radars
+let radarIntervals = { FRIENDLY: null, NAUGHTY: null };
+let lastRadarMessages = { FRIENDLY: null, NAUGHTY: null };
+let lastOnlineCounts = { FRIENDLY: -1, NAUGHTY: -1 };
+let previousNaughtyOnline = null; 
 
-// --- REUSABLE ROSTER FUNCTION ---
-async function displayRoster(target) {
-    const allSignups = db.prepare('SELECT * FROM signups ORDER BY id ASC').all();
-    if (allSignups.length === 0) return;
+const formatVoc = (voc) => {
+    const v = voc.toLowerCase();
+    if (v.includes('knight')) return '🛡️';
+    if (v.includes('druid')) return '❄️';
+    if (v.includes('sorcerer')) return '🔥';
+    if (v.includes('paladin')) return '🏹';
+    if (v.includes('monk')) return '🧘‍♂️';
+    return '❓ None';
+};
 
-    if (lastRosterMessage) {
-        try { await lastRosterMessage.delete(); } catch (e) { console.error("Could not delete old roster"); }
-    }
+async function buildRadarData(db, type) {
+    try {
+        const trackedGuildsDB = db.prepare('SELECT * FROM tracked_guilds').all();
+        const trackedCharsDB = db.prepare('SELECT * FROM tracked_chars').all();
 
-    const rosterEmbed = { title: "📜 Official Raid Roster", color: 0x0099ff, fields: [] };
-    const maxPlayers = 15;
-    const fortyEightHours = 48 * 60 * 60 * 1000;
-    const firstSignupTime = new Date(allSignups[0]?.created_at || Date.now()).getTime();
-    const windowExpired = (Date.now() - firstSignupTime) > fortyEightHours;
+        let guildsToFetch = [];
+        let charsToTrack = {};
+        let totalOnline = 0;
+        let output = [];
+        let currentNaughtyNames = [];
+        let currentNaughtyDetails = []; 
 
-    const row = new ActionRowBuilder();
-    const currentBosses = [...new Set(allSignups.map(s => s.boss_choice))];
-    
-    const hasDT = currentBosses.some(b => b.includes('LLK') || b.includes('HOD') || b.includes('BOTH'));
-    const hasFeru = currentBosses.some(b => b.includes('FERU'));
+        if (type === 'FRIENDLY') {
+            const friendlyGuilds = trackedGuildsDB.filter(g => g.type === 'FRIENDLY').map(g => g.guild_name);
+            guildsToFetch = [...CORE_GUILDS, ...friendlyGuilds];
+            
+            charsToTrack.alts = trackedCharsDB.filter(c => c.type === 'ALT').map(c => c.char_name.toLowerCase());
+            charsToTrack.friends = trackedCharsDB.filter(c => c.type === 'FRIEND').map(c => c.char_name.toLowerCase());
+        } else if (type === 'NAUGHTY') {
+            guildsToFetch = trackedGuildsDB.filter(g => g.type === 'NAUGHTY').map(g => g.guild_name);
+            charsToTrack.naughty = trackedCharsDB.filter(c => c.type === 'NAUGHTY').map(c => c.char_name.toLowerCase());
+        }
 
-    if (hasDT) {
-        row.addComponents(
-            new ButtonBuilder().setCustomId('choice_LLK').setLabel('LLK').setStyle(ButtonStyle.Primary).setEmoji('⚔️'),
-            new ButtonBuilder().setCustomId('choice_HOD').setLabel('HoD').setStyle(ButtonStyle.Success).setEmoji('🛡️'),
-            new ButtonBuilder().setCustomId('choice_BOTH').setLabel('Both').setStyle(ButtonStyle.Danger).setEmoji('🔥')
+        const apiCalls = guildsToFetch.map(guild => 
+            fetch(`https://api.tibiadata.com/v4/guild/${encodeURIComponent(guild)}`).then(res => res.json()).catch(() => ({}))
         );
-    } else if (hasFeru) {
-        row.addComponents(new ButtonBuilder().setCustomId('choice_FERU').setLabel('Ferumbras').setStyle(ButtonStyle.Danger).setEmoji('🧙‍♂️'));
-    }
-    row.addComponents(new ButtonBuilder().setCustomId('dropout_btn').setLabel('Drop Out').setStyle(ButtonStyle.Secondary).setEmoji('🏃'));
+        apiCalls.push(fetch(`https://api.tibiadata.com/v4/world/${encodeURIComponent(WORLD_NAME)}`).then(res => res.json()).catch(() => ({})));
 
-    const addSection = (name, emoji, key) => {
-        const players = allSignups.filter(p => 
-            p.boss_choice.includes(key) || 
-            (p.boss_choice.includes('BOTH') && (key === 'LLK' || key === 'HOD')) ||
-            p.boss_choice === 'LAST_RESORT'
-        );
+        const results = await Promise.all(apiCalls);
+        const worldData = results.pop(); 
+        const guildResults = results; 
 
-        if (players.length > 0) {
-            let lastResorts = players.filter(p => p.boss_choice === 'LAST_RESORT');
-            let others = players.filter(p => p.boss_choice !== 'LAST_RESORT');
-            let mainList = windowExpired ? others : others.filter(p => !p.boss_choice.startsWith('PUBLIC_'));
-            let publicQueue = windowExpired ? [] : others.filter(p => p.boss_choice.startsWith('PUBLIC_'));
+        const onlineWorldPlayers = worldData?.world?.online_players || [];
+        const onlineNamesList = onlineWorldPlayers.map(p => p.name.toLowerCase());
 
-            const mainTeam = mainList.slice(0, maxPlayers);
-            const puffinReserves = mainList.slice(maxPlayers);
-
-            const mainText = mainTeam.map(p => `• **${p.character_name}** [Lvl ${p.level}] (${p.vocation})`).join('\n');
-            rosterEmbed.fields.push({ name: `${emoji} ${name} TEAM (${mainTeam.length}/${maxPlayers})`, value: mainText || "Empty", inline: false });
-
-            if (puffinReserves.length > 0) {
-                const resText = puffinReserves.map(p => `• **${p.character_name}** [Lvl ${p.level}] (${p.vocation})`).join('\n');
-                rosterEmbed.fields.push({ name: `⏳ ${name} PUFFIN RESERVES`, value: resText, inline: false });
-            }
-
-            if (publicQueue.length > 0) {
-                const publicText = publicQueue.map(p => `• **${p.character_name}** [Lvl ${p.level}] (${p.vocation})`).join('\n');
-                rosterEmbed.fields.push({ name: `📢 ${name} PUBLIC QUEUE (Waitlist)`, value: publicText, inline: false });
-            }
-
-            if (lastResorts.length > 0) {
-                const lastText = lastResorts.map(p => `• **${p.character_name}** [Lvl ${p.level}] (${p.vocation})`).join('\n');
-                rosterEmbed.fields.push({ name: `🆘 ${name} LAST RESORT RESERVES`, value: lastText, inline: false });
+        // ⏱️ STOPWATCH CLEANUP: If the API worked, purge logged-off players from the DB
+        if (onlineNamesList.length > 0) {
+            const activeTimers = db.prepare('SELECT char_name FROM online_timers').all();
+            const deleteStmt = db.prepare('DELETE FROM online_timers WHERE char_name = ?');
+            for (const timer of activeTimers) {
+                if (!onlineNamesList.includes(timer.char_name)) {
+                    deleteStmt.run(timer.char_name);
+                }
             }
         }
-    };
 
-    if (hasDT) { addSection('LLK', '⚔️', 'LLK'); addSection('HoD', '🛡️', 'HOD'); }
-    if (hasFeru) { addSection('FERUMBRAS', '🧙‍♂️', 'FERU'); }
+        // ⏱️ STOPWATCH MATH HELPER
+        const getTimerString = (name) => {
+            const lowerName = name.toLowerCase();
+            let record = db.prepare('SELECT spotted_at FROM online_timers WHERE char_name = ?').get(lowerName);
+            if (!record) {
+                const now = Date.now();
+                db.prepare('INSERT INTO online_timers (char_name, spotted_at) VALUES (?, ?)').run(lowerName, now);
+                return `\`[0m]\``;
+            }
+            const mins = Math.floor((Date.now() - record.spotted_at) / 60000);
+            const hrs = Math.floor(mins / 60);
+            if (hrs > 0) return `\`[${hrs}h ${mins % 60}m]\``;
+            return `\`[${mins}m]\``;
+        };
 
-    const timeLeft = Math.max(0, (fortyEightHours - (Date.now() - firstSignupTime)) / (1000 * 60 * 60));
-    rosterEmbed.footer = { 
-        text: (windowExpired ? "✅ Public queue merged." : `🕒 Public queue merges in ${timeLeft.toFixed(1)}h.`) + "\n❌ Type !dropout to flee"
-    };
+        const processGuild = (guildName, apiData) => {
+            if (!apiData?.guild?.members) return null;
+            const onlineMembers = apiData.guild.members.filter(m => m.status === 'online');
+            if (onlineMembers.length === 0) return null;
 
-    lastRosterMessage = await target.send({ embeds: [rosterEmbed], components: row.components.length > 0 ? [row] : [] });
+            totalOnline += onlineMembers.length;
+
+            let text = `**${guildName}:**\n`;
+            onlineMembers.forEach(m => {
+                text += `${formatVoc(m.vocation)} ${m.name} (${m.level}) ${getTimerString(m.name)}\n`;
+            });
+            return text + '\n';
+        };
+
+        if (type === 'FRIENDLY') {
+            CORE_GUILDS.forEach((guildName, index) => {
+                const guildText = processGuild(guildName, guildResults[index]);
+                if (guildText) output.push(guildText);
+            });
+
+            const onlineAlts = onlineWorldPlayers.filter(p => charsToTrack.alts.includes(p.name.toLowerCase()));
+            if (onlineAlts.length > 0) {
+                totalOnline += onlineAlts.length;
+                output.push(`**Puffin Alts:**\n` + onlineAlts.map(p => `${formatVoc(p.vocation)} ${p.name} (${p.level}) ${getTimerString(p.name)}`).join('\n') + '\n\n');
+            }
+
+            const friendlyGuilds = guildsToFetch.slice(CORE_GUILDS.length);
+            friendlyGuilds.forEach((guildName, i) => {
+                const guildText = processGuild(guildName, guildResults[CORE_GUILDS.length + i]);
+                if (guildText) output.push(`🤝 ` + guildText);
+            });
+
+            const onlineFriends = onlineWorldPlayers.filter(p => charsToTrack.friends.includes(p.name.toLowerCase()));
+            if (onlineFriends.length > 0) {
+                totalOnline += onlineFriends.length;
+                output.push(`**Friends:**\n` + onlineFriends.map(p => `${formatVoc(p.vocation)} ${p.name} (${p.level}) ${getTimerString(p.name)}`).join('\n') + '\n\n');
+            }
+        } else if (type === 'NAUGHTY') {
+            guildsToFetch.forEach((guildName, index) => {
+                const apiData = guildResults[index];
+                if (apiData?.guild?.members) {
+                    const onlineMembers = apiData.guild.members.filter(m => m.status === 'online');
+                    onlineMembers.forEach(m => {
+                        currentNaughtyDetails.push({ name: m.name, voc: formatVoc(m.vocation), level: m.level });
+                    });
+                }
+                const guildText = processGuild(guildName, apiData);
+                if (guildText) output.push(`⚔️ ` + guildText);
+            });
+
+            const onlineNaughty = onlineWorldPlayers.filter(p => charsToTrack.naughty.includes(p.name.toLowerCase()));
+            if (onlineNaughty.length > 0) {
+                totalOnline += onlineNaughty.length;
+                onlineNaughty.forEach(p => {
+                    currentNaughtyDetails.push({ name: p.name, voc: formatVoc(p.vocation), level: p.level });
+                });
+                output.push(`**Naughty Characters:**\n` + onlineNaughty.map(p => `${formatVoc(p.vocation)} ${p.name} (${p.level}) ${getTimerString(p.name)}`).join('\n') + '\n\n');
+            }
+            
+            const uniqueDetailsMap = new Map();
+            currentNaughtyDetails.forEach(p => uniqueDetailsMap.set(p.name, p));
+            currentNaughtyDetails = Array.from(uniqueDetailsMap.values());
+            currentNaughtyNames = Array.from(uniqueDetailsMap.keys());
+        }
+
+        const title = type === 'FRIENDLY' ? `🌍 Puffins & Friends Radar` : `☠️ Naughty Radar`;
+        const color = type === 'FRIENDLY' ? 0x0099ff : 0xff0000;
+        const description = output.length > 0 ? output.join('').substring(0, 4096) : "💨 **The lands are quiet.** No tracked targets are online.";
+
+        const embed = new EmbedBuilder()
+            .setTitle(title)
+            .setColor(color)
+            .setDescription(description)
+            .setFooter({ text: "Auto-updates every 5 mins | Timers track since first spotted" })
+            .setTimestamp();
+
+        return { embed, totalOnline, currentNaughtyNames, currentNaughtyDetails };
+
+    } catch (error) {
+        console.error(`Radar Fetch Error (${type}):`, error);
+        const embed = new EmbedBuilder().setTitle(`🌍 ${type} Radar`).setColor(0xff0000).setDescription("⚠️ **API Error:** The Queen's scouts were ambushed! Retrying in 5 minutes...");
+        return { embed, totalOnline: -1, currentNaughtyNames: null, currentNaughtyDetails: null };
+    }
 }
 
-// --- HYPE LOOP (State Recovery Enabled) ---
-const startHypeLoop = (channel, raidType, db, isAutoResume = false) => {
-    if (hypeTimer) clearTimeout(hypeTimer);
-    
-    // Ensure the gates are open in the bot's memory!
-    gatesOpen = true; 
-    
-    const fortyEightHours = 48 * 60 * 60 * 1000;
+async function updateRadarMessage(channel, db, type) {
+    const { embed, totalOnline, currentNaughtyNames, currentNaughtyDetails } = await buildRadarData(db, type);
+    const taskName = type === 'FRIENDLY' ? 'RADAR_FRIENDLY' : 'RADAR_NAUGHTY';
 
-    const loop = () => {
-        if (!gatesOpen) return;
-        channel.send(`🔥 **THE RAID CONTINUES!** 🔥\nStill need Puffins for **${raidType}**!`);
-        displayRoster(channel);
-        db.prepare('UPDATE active_tasks SET next_run_time = ? WHERE task_name = ?').run(Date.now() + fortyEightHours, 'RAID_HYPE');
-        hypeTimer = setTimeout(loop, fortyEightHours);
-    };
-
-    if (!isAutoResume) {
-        // Started manually! Save it to the database with the raidType as extra_data
-        db.prepare('INSERT OR REPLACE INTO active_tasks (task_name, channel_id, next_run_time, extra_data) VALUES (?, ?, ?, ?)')
-          .run('RAID_HYPE', channel.id, Date.now() + fortyEightHours, raidType);
-        hypeTimer = setTimeout(loop, fortyEightHours);
+    if (!lastRadarMessages[type]) {
+        lastRadarMessages[type] = await channel.send({ embeds: [embed] });
+        db.prepare('UPDATE active_tasks SET extra_data = ? WHERE task_name = ?').run(lastRadarMessages[type].id, taskName);
     } else {
-        // Auto-Resumed after a reboot! Check how much time is left.
-        const task = db.prepare('SELECT next_run_time, extra_data FROM active_tasks WHERE task_name = ?').get('RAID_HYPE');
-        let timeLeft = task.next_run_time - Date.now();
-
-        if (timeLeft <= 0) {
-            // The bot missed a hype announcement while offline! Send it now.
-            channel.send(`🔥 **THE RAID CONTINUES!** 🔥\nStill need Puffins for **${task.extra_data}**!`);
-            displayRoster(channel);
-            timeLeft = fortyEightHours;
-            db.prepare('UPDATE active_tasks SET next_run_time = ? WHERE task_name = ?').run(Date.now() + fortyEightHours, 'RAID_HYPE');
+        try {
+            await lastRadarMessages[type].edit({ embeds: [embed] });
+        } catch (e) {
+            lastRadarMessages[type] = await channel.send({ embeds: [embed] });
+            db.prepare('UPDATE active_tasks SET extra_data = ? WHERE task_name = ?').run(lastRadarMessages[type].id, taskName);
         }
-        hypeTimer = setTimeout(loop, timeLeft);
     }
-};
 
-const stopHypeLoop = (db) => {
-    if (hypeTimer) {
-        clearTimeout(hypeTimer);
-        hypeTimer = null;
+    if (totalOnline !== -1 && totalOnline !== lastOnlineCounts[type]) {
+        lastOnlineCounts[type] = totalOnline;
+        const newName = type === 'FRIENDLY' ? `puffins-online-${totalOnline}` : `naughty-online-${totalOnline}`;
+        try {
+            await channel.setName(newName);
+        } catch (e) {
+            console.error(`Could not rename channel ${channel.id}. Check bot permissions.`);
+        }
     }
-    gatesOpen = false;
-    // Wipe it from permanent memory
-    if (db) db.prepare('DELETE FROM active_tasks WHERE task_name = ?').run('RAID_HYPE');
-};
 
-// --- GETTERS & SETTERS ---
-module.exports = {
-    displayRoster,
-    startHypeLoop,
-    stopHypeLoop,
-    getNextWednesday,
-    isGatesOpen: () => gatesOpen,
-    setGatesOpen: (status) => { gatesOpen = status; }
-};
+    if (type === 'NAUGHTY' && currentNaughtyNames) {
+        if (previousNaughtyOnline !== null) {
+            const newlyOnlineNames = currentNaughtyNames.filter(name => !previousNaughtyOnline.includes(name));
+            
+            if (newlyOnlineNames.length > 0) {
+                const newlyOnlineDetails = currentNaughtyDetails.filter(p => newlyOnlineNames.includes(p.name));
+                const formattedNames = newlyOnlineDetails.map(p => `${p.voc} ${p.name} (${p.level})`).join(', ');
+
+                const subscribers = db.prepare('SELECT discord_user_id FROM alert_subscribers').all();
+                if (subscribers.length > 0) {
+                    const alertMsg = `🚨 **NAUGHTY ALERT (${newlyOnlineNames.length})** 🚨\nThe Queen's scouts spotted the following enemies logging in:\n${formattedNames}`;
+                    
+                    for (const sub of subscribers) {
+                        try {
+                            const user = await channel.client.users.fetch(sub.discord_user_id);
+                            await user.send(alertMsg);
+                        } catch (e) {
+                            console.error(`Could not DM user ${sub.discord_user_id}.`);
+                        }
+                    }
+                }
+            }
+        }
+        previousNaughtyOnline = currentNaughtyNames;
+    }
+}
+
+async function startRadar(channel, db, type, isAutoResume = false, savedMessageId = null) {
+    const typeUpper = type.toUpperCase();
+    if (typeUpper !== 'FRIENDLY' && typeUpper !== 'NAUGHTY') return;
+    
+    if (radarIntervals[typeUpper]) clearInterval(radarIntervals[typeUpper]);
+    
+    const taskName = typeUpper === 'FRIENDLY' ? 'RADAR_FRIENDLY' : 'RADAR_NAUGHTY';
+
+    if (isAutoResume && savedMessageId) {
+        try {
+            lastRadarMessages[typeUpper] = await channel.messages.fetch(savedMessageId);
+        } catch (err) {
+            lastRadarMessages[typeUpper] = null;
+        }
+    } else if (!isAutoResume) {
+        db.prepare('INSERT OR REPLACE INTO active_tasks (task_name, channel_id) VALUES (?, ?)').run(taskName, channel.id);
+    }
+    
+    await updateRadarMessage(channel, db, typeUpper);
+    
+    radarIntervals[typeUpper] = setInterval(() => {
+        updateRadarMessage(channel, db, typeUpper);
+    }, 5 * 60 * 1000);
+}
+
+function stopRadar(db, type) {
+    const typeUpper = type.toUpperCase();
+    if (radarIntervals[typeUpper]) {
+        clearInterval(radarIntervals[typeUpper]);
+        radarIntervals[typeUpper] = null;
+        lastOnlineCounts[typeUpper] = -1; 
+    }
+    const taskName = typeUpper === 'FRIENDLY' ? 'RADAR_FRIENDLY' : 'RADAR_NAUGHTY';
+    if (db) db.prepare('DELETE FROM active_tasks WHERE task_name = ?').run(taskName);
+}
+
+module.exports = { startRadar, stopRadar };
