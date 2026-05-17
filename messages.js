@@ -37,23 +37,23 @@ module.exports = {
         "If you’re this lazy with your words, I dread to see your boss mechanics.",
         "A Lazy Option? The Queen is unimpressed by your lack of effort.",
         "Grats you found the 'Lazy Option' button. Try harder before I help you find the 'Leave Server' button.",
-        "Another peasant who finds typing too taxing for their fragile monkish hands.",
+        "On your last warning for the lazy option, buckle up Puffin!",
         "Laziness is a Monk-like trait. What's next, monkish vow of silence?",
-        "Wow, the absolute bare minimum. You are a BAD and PUNISHED Puffin!"
+        "Wow, the absolute bare minimum. You are a BAD and PUNISHED Puffin!",
+        
     ],
     lazyQueenMessages: [
-        "I'm only here for the loot.",
+        "I used the lazy option so I forfeit my loot to the guild.",
         "My sword is yours, but my words are expensive.",
         "I forgot my speech at home.",
         "Hail to the Queen, I guess.",
         "I will be emotionally supportive and slightly aroused.",
         "PRAISE FORTUNA! I don’t know what we’re doing but I love you.",
         "I’ll join but I refuse to learn any mechanics.",
-        "Dennis told me not to come, so obviously I am.",
+        "I was told that there'd be cake.",
         "I said yes before reading what the quest was.",
         "Will Chris Cuddlebear be there? This affects my decision.", 
-        
-        
+                
     ],
     // A handy function to pick a random message from the lists above
     getRandom: function(array) {
